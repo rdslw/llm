@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import datetime
 import inspect
 import io
 import json
@@ -1612,6 +1613,46 @@ def keys_set(name, value):
     path.write_text(json.dumps(current, indent=2) + "\n")
 
 
+def localtime_enabled_in_userdir():
+    """Check if logs-localtime file exists in user config dir."""
+    return (user_dir() / "logs-localtime").exists()
+
+
+def format_datetime(dt_str, use_localtime):
+    """
+    Convert UTC datetime string to display format.
+
+    Args:
+        dt_str: ISO format datetime string (assumed to be UTC)
+        use_localtime: If True, convert to local timezone; if False, keep as UTC
+
+    Returns:
+        Formatted datetime string without microseconds
+    """
+    if not dt_str:
+        return ""
+
+    try:
+        # Parse the ISO string - it's in UTC
+        dt_utc = datetime.datetime.fromisoformat(dt_str)
+
+        # Ensure it's marked as UTC
+        if dt_utc.tzinfo is None:
+            dt_utc = dt_utc.replace(tzinfo=datetime.timezone.utc)
+
+        # Convert to local timezone if requested
+        if use_localtime:
+            dt_display = dt_utc.astimezone()
+        else:
+            dt_display = dt_utc
+
+        # Return formatted without microseconds
+        return dt_display.strftime("%Y-%m-%dT%H:%M:%S")
+    except (ValueError, TypeError):
+        # Fall back to returning the original string, removing microseconds
+        return dt_str.split(".")[0] if dt_str else ""
+
+
 @cli.group(
     cls=DefaultGroup,
     default="list",
@@ -1751,13 +1792,15 @@ def annotate_log_rows(db, rows, expand=False, truncate=False):
     return {id: extras["attachments"] for id, extras in extras_by_id.items()}
 
 
-def log_rows_as_json(rows, attachments_by_id):
+def log_rows_as_json(rows, attachments_by_id, use_localtime=False):
     "Serialize annotated log rows to the JSON used by 'llm logs --json'"
     for row in rows:
         row["attachments"] = [
             {k: v for k, v in attachment.items() if k != "response_id"}
             for attachment in attachments_by_id.get(row["id"], [])
         ]
+        if use_localtime and "datetime_utc" in row:
+            row["datetime"] = format_datetime(row["datetime_utc"], True)
     return json.dumps(list(rows), indent=2)
 
 
@@ -1875,6 +1918,13 @@ def logs_json_for_response_ids(db, ids):
     is_flag=True,
     help="Expand fragments to show their content",
 )
+@click.option(
+    "-L",
+    "--localtime",
+    is_flag=True,
+    default=None,
+    help="Display datetimes in localtime tz (default: utc), also check logs-localtime file in userdir",
+)
 def logs_list(
     count,
     path,
@@ -1903,8 +1953,15 @@ def logs_list(
     id_gte,
     json_output,
     expand,
+    localtime,
 ):
     "Show logged prompts and their responses"
+    # Resolve localtime flag: explicit flag takes precedence, else check config file
+    if localtime is None:
+        use_localtime = localtime_enabled_in_userdir()
+    else:
+        use_localtime = localtime
+
     if database and not path:
         path = database
     path = pathlib.Path(path or logs_db_path())
@@ -2031,7 +2088,7 @@ def logs_list(
     output = None
     if json_output:
         # Output as JSON if requested
-        output = log_rows_as_json(rows, attachments_by_id)
+        output = log_rows_as_json(rows, attachments_by_id, use_localtime)
     elif extract or extract_last:
         # Extract and return first code block
         for row in rows:
@@ -2158,7 +2215,7 @@ def logs_list(
                 attachments = attachments_by_id.get(row["id"])
                 obj = {
                     "model": row["model"],
-                    "datetime": row["datetime_utc"].split(".")[0],
+                    "datetime": format_datetime(row["datetime_utc"], use_localtime),
                     "duration_ms": row["duration_ms"],
                     "conversation": cid,
                 }
@@ -2205,7 +2262,7 @@ def logs_list(
             # Not short, output Markdown
             click.echo(
                 "# {}{}\n{}".format(
-                    row["datetime_utc"].split(".")[0],
+                    format_datetime(row["datetime_utc"], use_localtime),
                     (
                         "    conversation: {} id: {}".format(
                             row["conversation_id"], row["id"]

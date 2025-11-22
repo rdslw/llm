@@ -393,6 +393,8 @@ Options:
   --id-gte TEXT               Return responses with ID >= this
   --json                      Output logs as JSON
   -e, --expand                Expand fragments to show their content
+  -L, --localtime             Display datetimes in localtime tz (default: utc),
+                              also check logs-localtime file in userdir
   -h, --help                  Show this message and exit.
 ```
 
