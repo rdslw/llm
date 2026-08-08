@@ -1360,6 +1360,78 @@ def test_logs_truncate_markdown_new_store(logs_db, mock_model):
     assert "## Response\n\nhello" in result.output
 
 
+def test_logs_response_json_resolution_skipped_unless_needed(
+    logs_db, mock_model, monkeypatch
+):
+    """Resolving a turn's response_json goes through the model registry -
+    a full plugin register_models pass per row - so the views that never
+    show it (markdown, and --truncate even under --json) must not pay it."""
+    import llm.logs
+
+    mock_model.enqueue(["hello"])
+    response = mock_model.prompt("hi")
+    response.text()
+    response.response_json = {"content": "hello", "usage": {"output": 1}}
+    response.log_to_db(logs_db)
+
+    calls = []
+    original = llm.logs._model_json_replacements
+
+    def counting(model_id):
+        calls.append(model_id)
+        return original(model_id)
+
+    monkeypatch.setattr(llm.logs, "_model_json_replacements", counting)
+    runner = CliRunner()
+
+    result = runner.invoke(cli, ["logs"], catch_exceptions=False)
+    assert result.exit_code == 0
+    assert calls == []
+
+    result = runner.invoke(cli, ["logs", "-t", "--json"], catch_exceptions=False)
+    assert result.exit_code == 0
+    assert calls == []
+    assert "response_json" not in json.loads(result.output)[0]
+
+    # --json without -t does show it, so there it is still resolved
+    # back to the payload as the provider sent it
+    result = runner.invoke(cli, ["logs", "--json"], catch_exceptions=False)
+    assert result.exit_code == 0
+    assert calls == ["mock"]
+    row = json.loads(result.output)[0]
+    assert row["response_json"] == {"content": "hello", "usage": {"output": 1}}
+
+
+def test_logs_response_json_registry_walk_once_per_model(
+    logs_db, mock_model, monkeypatch
+):
+    """--json resolves response_json for every row, but the registry
+    walk behind it must run once per model id, not once per row."""
+    import llm.logs
+
+    for text in ("one", "two"):
+        mock_model.enqueue([text])
+        response = mock_model.prompt(text)
+        response.text()
+        response.response_json = {"content": text}
+        response.log_to_db(logs_db)
+
+    calls = []
+    original = llm.logs._model_json_replacements
+
+    def counting(model_id):
+        calls.append(model_id)
+        return original(model_id)
+
+    monkeypatch.setattr(llm.logs, "_model_json_replacements", counting)
+    runner = CliRunner()
+    result = runner.invoke(cli, ["logs", "--json"], catch_exceptions=False)
+    assert result.exit_code == 0
+    rows = json.loads(result.output)
+    assert [row["response_json"]["content"] for row in rows] == ["one", "two"]
+    assert calls == ["mock"]
+
+
 def test_logs_localtime_flag_markdown(log_path, monkeypatch):
     """Test that -L/--localtime flag displays datetime in local timezone for markdown output"""
 

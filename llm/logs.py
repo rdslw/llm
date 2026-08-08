@@ -1158,8 +1158,14 @@ class _LogRowBuilder:
     length.
     """
 
-    def __init__(self, store: "LogStore"):
+    def __init__(self, store: "LogStore", resolve_response_json: bool = True):
         self.store = store
+        self.resolve_response_json = resolve_response_json
+        # _model_json_replacements walks the full plugin model registry,
+        # so resolve each model id once per listing rather than per row.
+        # Scoped to the builder - which lives for one log_rows() call -
+        # so plugins registered later are never hidden by a stale cache.
+        self._replacements_by_model: dict[str | None, Any] = {}
 
     def build(self, row: dict) -> dict:
         inputs = self.store.load_chain(row["parent_message_hash"])
@@ -1218,12 +1224,6 @@ class _LogRowBuilder:
                 "reasoning": _text_of(out_parts, ReasoningPart) or None,
                 # No longer stored: the chain holds the structure.
                 "prompt_json": None,
-                # Stored condensed against the turn's own messages;
-                # resolved here so the row carries the payload as the
-                # provider sent it. A payload whose references no longer
-                # resolve renders as absent rather than failing the
-                # whole listing.
-                "response_json": self._resolve_response_json(row, outputs),
                 "_input_parts": input_parts,
                 "_output_parts": out_parts,
                 # Internal, stripped before rendering - the enrichment
@@ -1235,6 +1235,16 @@ class _LogRowBuilder:
                 "_tip_message_hash": row["tip_message_hash"],
             }
         )
+        # Stored condensed against the turn's own messages; resolved
+        # here so the row carries the payload as the provider sent it.
+        # A payload whose references no longer resolve renders as
+        # absent rather than failing the whole listing. Resolution
+        # goes through the model registry (get_model per model id),
+        # which loads every plugin's models - callers whose output
+        # never shows response_json skip it, and the key is left out
+        # just as the truncated renderers would have dropped it.
+        if self.resolve_response_json:
+            built["response_json"] = self._resolve_response_json(row, outputs)
         return built
 
     def _resolve_response_json(self, row: dict, outputs) -> str | None:
@@ -1248,11 +1258,16 @@ class _LogRowBuilder:
                     outputs,
                     self.store._turn_tool_pairs(row["id"]),
                     schema=_load(row.get("schema_json")),
-                    model_replacements=_model_json_replacements(row.get("model")),
+                    model_replacements=self._model_replacements(row.get("model")),
                 )
             )
         except UncondenseError:
             return None
+
+    def _model_replacements(self, model_id: str | None):
+        if model_id not in self._replacements_by_model:
+            self._replacements_by_model[model_id] = _model_json_replacements(model_id)
+        return self._replacements_by_model[model_id]
 
     def _input_segment_hashes(self, parent_hash: str | None) -> list[str]:
         """Hashes of the turn's own input messages - the same trailing
@@ -1292,6 +1307,7 @@ def log_rows(
     ids=(),
     query: str | None = None,
     latest: bool = False,
+    resolve_response_json: bool = True,
 ) -> list[dict]:
     """Rows for `llm logs`, newest first, drawn from the new tables.
 
@@ -1367,7 +1383,7 @@ def log_rows(
         order_by=order_by,
         limit=f" limit {count}" if count else "",
     )
-    builder = _LogRowBuilder(store)
+    builder = _LogRowBuilder(store, resolve_response_json=resolve_response_json)
     return [builder.build(row) for row in store.db.query(sql, params)]
 
 
@@ -1716,6 +1732,7 @@ def merged_log_rows(
     count: int | None = None,
     query: str | None = None,
     latest: bool = False,
+    resolve_response_json: bool = True,
     **filters,
 ):
     """Rows for `llm logs`: the new tables plus legacy-only responses.
@@ -1731,7 +1748,14 @@ def merged_log_rows(
     since both index the same kind of corpus with the same tokenizer.
     ``latest`` makes the query a pure filter and keeps recency order.
     """
-    rows = log_rows(store, count=count, query=query, latest=latest, **filters)
+    rows = log_rows(
+        store,
+        count=count,
+        query=query,
+        latest=latest,
+        resolve_response_json=resolve_response_json,
+        **filters,
+    )
     rows.extend(
         legacy_log_rows(store.db, count=count, query=query, latest=latest, **filters)
     )

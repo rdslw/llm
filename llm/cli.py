@@ -1993,6 +1993,11 @@ def logs_list(
             id_gte=id_gte,
             query=query,
             latest=latest,
+            # response_json only ever reaches --json output, and
+            # --truncate strips it even there. Resolving it costs a
+            # model registry lookup per row, so skip it when no output
+            # path will show it.
+            resolve_response_json=json_output and not truncate,
         )
     except sqlite3.OperationalError as ex:
         if query:
