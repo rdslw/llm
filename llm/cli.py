@@ -1376,12 +1376,17 @@ def load_conversation(
     if conversation_id is None:
         # Most recent conversation from either generation of tables -
         # thread ids are conversation ids, so the union dedupes rows
-        # from the dual-write era.
+        # from the dual-write era. Each side reads its newest row off
+        # the primary key rather than deduping both tables in full.
         matches = list(db.query("""
                 select id from (
-                    select id from threads
+                    select id from (
+                        select id from threads order by id desc limit 1
+                    )
                     union
-                    select id from conversations
+                    select id from (
+                        select id from conversations order by id desc limit 1
+                    )
                 ) order by id desc limit 1
                 """))
         if matches:
@@ -1946,12 +1951,20 @@ def logs_list(
     if current_conversation:
         try:
             # Thread ids are conversation ids and both id spaces are
-            # ULIDs, so the most recent of either world wins.
+            # ULIDs, so the most recent of either world wins. Each side
+            # reads its newest row off the primary key rather than
+            # scanning and sorting both tables.
             conversation_id = next(db.query("""
                     select conversation_id from (
-                        select thread_id as conversation_id, id from turns
+                        select conversation_id, id from (
+                            select thread_id as conversation_id, id from turns
+                            order by id desc limit 1
+                        )
                         union all
-                        select conversation_id, id from responses
+                        select conversation_id, id from (
+                            select conversation_id, id from responses
+                            order by id desc limit 1
+                        )
                     ) order by id desc limit 1
                     """))["conversation_id"]
         except StopIteration:
