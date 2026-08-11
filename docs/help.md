@@ -133,6 +133,8 @@ Options:
   --ta, --tools-approve           Manually approve every tool execution
   --cl, --chain-limit INTEGER     How many chained tool responses to allow,
                                   default 5, set 0 for unlimited
+  --cr, --chain-retry INTEGER     How many total attempts on retryable errors,
+                                  default 1 (no retry), set 0 for unlimited
   -o, --option <TEXT TEXT>...     key/value options for the model
   --options                       Show options for the selected model
   --schema TEXT                   JSON schema, filepath or ID

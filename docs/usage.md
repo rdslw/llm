@@ -35,6 +35,12 @@ export LLM_MODEL=gpt-4.1
 llm 'Ten names for cheesecakes' # Uses gpt-4.1
 ```
 
+Some failures are transient - overloaded servers, rate limits, HTTP 5xx errors. Pass `--cr/--chain-retry` to retry the request automatically on such errors, with exponential backoff (0.125s, 0.5s, 2s, 8s... capped at 600s):
+```bash
+llm 'Ten names for cheesecakes' --cr 3
+```
+The value is the maximum total number of attempts - the default `1` means no retry, `0` means retry without limit. Retry notices go to stderr, so piped stdout stays clean. Only errors that look temporary are retried; other errors, or a failure after the response has started streaming, fail immediately as usual. See {ref}`retry` for details.
+
 You can send a prompt directly to standard input like this:
 ```bash
 echo 'Ten names for cheesecakes' | llm
