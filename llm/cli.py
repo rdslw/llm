@@ -12,6 +12,7 @@ import shutil
 import sqlite3
 import sys
 import textwrap
+import time
 import warnings
 from collections.abc import Iterable
 from dataclasses import asdict
@@ -37,6 +38,7 @@ from llm import (
     Conversation,
     Fragment,
     KeyModel,
+    ModelError,
     Response,
     ServerSideTool,
     Template,
@@ -101,12 +103,15 @@ class FragmentNotFound(Exception):
     pass
 
 
-def display_stream_events(events, *, show_reasoning=True):
+def display_stream_events(events, *, show_reasoning=True, printed=None):
     """Consume a sync iterator of StreamEvents and write them.
 
     Text events go to stdout. Reasoning events go to stderr in dim style.
     A newline is written to stderr at each reasoning→text transition so
     the assistant text starts on a fresh visual line.
+
+    Pass a dict as printed to have printed["stdout"] set to True once
+    any text has been written to stdout.
     """
     was_reasoning = False
     for event in events:
@@ -115,12 +120,14 @@ def display_stream_events(events, *, show_reasoning=True):
                 click.echo("", err=True)
                 was_reasoning = False
             click.echo(event.chunk, nl=False)
+            if printed is not None and event.chunk:
+                printed["stdout"] = True
         elif event.type == "reasoning" and show_reasoning:
             was_reasoning = True
             click.echo(click.style(event.chunk, dim=True), nl=False, err=True)
 
 
-async def display_async_stream_events(events, *, show_reasoning=True):
+async def display_async_stream_events(events, *, show_reasoning=True, printed=None):
     """Async counterpart of display_stream_events."""
     was_reasoning = False
     async for event in events:
@@ -129,9 +136,37 @@ async def display_async_stream_events(events, *, show_reasoning=True):
                 click.echo("", err=True)
                 was_reasoning = False
             click.echo(event.chunk, nl=False)
+            if printed is not None and event.chunk:
+                printed["stdout"] = True
         elif event.type == "reasoning" and show_reasoning:
             was_reasoning = True
             click.echo(click.style(event.chunk, dim=True), nl=False, err=True)
+
+
+_RETRYABLE_STATUS_CODES = {408, 409, 429}
+_RETRYABLE_MESSAGE_FRAGMENTS = ("overloaded", "try again", "rate limit", "temporarily")
+
+
+def _is_retryable_error(ex: Exception) -> bool:
+    """True for transient failures worth retrying: connection/timeout
+    errors, retryable HTTP status codes, and ModelErrors whose message
+    sounds temporary ("Our servers are currently overloaded...")."""
+    import openai  # Lazy: only needed on the error path
+
+    if isinstance(ex, openai.APIConnectionError):  # includes APITimeoutError
+        return True
+    status = getattr(ex, "status_code", None)
+    if isinstance(status, int) and (status in _RETRYABLE_STATUS_CODES or status >= 500):
+        return True
+    if isinstance(ex, ModelError):
+        message = str(ex).lower()
+        return any(fragment in message for fragment in _RETRYABLE_MESSAGE_FRAGMENTS)
+    return False
+
+
+def _retry_delay(attempt: int) -> float:
+    """Backoff after this many failed attempts, capped before exponentiation."""
+    return 600 if attempt >= 8 else 0.125 * 4 ** (attempt - 1)
 
 
 def _run_chat(
@@ -602,6 +637,17 @@ def cli():
 )
 @tool_options
 @click.option(
+    "chain_retry",
+    "--cr",
+    "--chain-retry",
+    type=int,
+    default=1,
+    help=(
+        "How many total attempts on retryable errors, "
+        "default 1 (no retry), set 0 for unlimited"
+    ),
+)
+@click.option(
     "options",
     "-o",
     "--option",
@@ -696,6 +742,7 @@ def prompt(
     tools_debug,
     tools_approve,
     chain_limit,
+    chain_retry,
     options,
     show_model_options,
     schema_input,
@@ -1076,67 +1123,108 @@ def prompt(
     if hide_reasoning:
         kwargs["hide_reasoning"] = True
 
+    responses_before = len(conversation.responses)
+    total = chain_retry or "unlimited"
+
+    def prepare_retry(ex, attempt, printed):
+        can_retry = (
+            _is_retryable_error(ex)
+            and not printed["stdout"]
+            and len(conversation.responses) == responses_before
+            and (chain_retry == 0 or attempt < chain_retry)
+        )
+        if not can_retry:
+            return None
+        delay = _retry_delay(attempt)
+        click.echo(
+            f"Retrying (attempt {attempt + 1}/{total}) in {delay:g}s: {ex}",
+            err=True,
+        )
+        return delay
+
     try:
         if async_:
 
-            async def inner():
-                if should_stream:
-                    response = prompt_method(
-                        prompt,
-                        attachments=resolved_attachments,
-                        system=system,
-                        schema=schema,
-                        fragments=resolved_fragments,
-                        system_fragments=resolved_system_fragments,
-                        **kwargs,
-                    )
-                    await display_async_stream_events(
-                        response.astream_events(),
-                        show_reasoning=not hide_reasoning,
-                    )
-                    print()
-                else:
-                    response = prompt_method(
-                        prompt,
-                        fragments=resolved_fragments,
-                        attachments=resolved_attachments,
-                        schema=schema,
-                        system=system,
-                        system_fragments=resolved_system_fragments,
-                        **kwargs,
-                    )
-                    text = await response.text()
-                    if extract or extract_last:
-                        text = (
-                            extract_fenced_code_block(text, last=extract_last) or text
+            async def run_async():
+                attempt = 0
+                while True:
+                    printed = {"stdout": False}
+                    try:
+                        response = prompt_method(
+                            prompt,
+                            attachments=resolved_attachments,
+                            system=system,
+                            schema=schema,
+                            fragments=resolved_fragments,
+                            system_fragments=resolved_system_fragments,
+                            **kwargs,
                         )
-                    if not json_output:
-                        print(text)
-                return response
+                        if should_stream:
+                            await display_async_stream_events(
+                                response.astream_events(),
+                                show_reasoning=not hide_reasoning,
+                                printed=printed,
+                            )
+                            print()
+                        else:
+                            text = await response.text()
+                            if extract or extract_last:
+                                text = (
+                                    extract_fenced_code_block(text, last=extract_last)
+                                    or text
+                                )
+                            if not json_output:
+                                print(text)
+                        return response
+                    except (ValueError, NotImplementedError):
+                        raise
+                    except Exception as ex:
+                        attempt += 1
+                        delay = prepare_retry(ex, attempt, printed)
+                        if delay is None:
+                            raise
+                        await asyncio.sleep(delay)
 
-            response = asyncio.run(inner())
+            response = asyncio.run(run_async())
         else:
-            response = prompt_method(
-                prompt,
-                fragments=resolved_fragments,
-                attachments=resolved_attachments,
-                system=system,
-                schema=schema,
-                system_fragments=resolved_system_fragments,
-                **kwargs,
-            )
-            if should_stream:
-                display_stream_events(
-                    response.stream_events(),
-                    show_reasoning=not hide_reasoning,
-                )
-                print()
-            else:
-                text = response.text()
-                if extract or extract_last:
-                    text = extract_fenced_code_block(text, last=extract_last) or text
-                if not json_output:
-                    print(text)
+            attempt = 0
+            while True:
+                printed = {"stdout": False}
+                try:
+                    response = prompt_method(
+                        prompt,
+                        fragments=resolved_fragments,
+                        attachments=resolved_attachments,
+                        system=system,
+                        schema=schema,
+                        system_fragments=resolved_system_fragments,
+                        **kwargs,
+                    )
+                    if should_stream:
+                        display_stream_events(
+                            response.stream_events(),
+                            show_reasoning=not hide_reasoning,
+                            printed=printed,
+                        )
+                        print()
+                    else:
+                        text = response.text()
+                        if extract or extract_last:
+                            text = (
+                                extract_fenced_code_block(text, last=extract_last)
+                                or text
+                            )
+                        if not json_output:
+                            print(text)
+                    break
+                except (ValueError, NotImplementedError):
+                    raise
+                except Exception as ex:
+                    attempt += 1
+                    delay = prepare_retry(ex, attempt, printed)
+                    if delay is None:
+                        raise
+                    time.sleep(delay)
     # List of exceptions that should never be raised in pytest:
     except (ValueError, NotImplementedError) as ex:
         raise click.ClickException(str(ex))
