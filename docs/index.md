@@ -129,6 +129,7 @@ maxdepth: 3
 ---
 setup
 usage
+retry
 openai-models
 other-models
 tools
