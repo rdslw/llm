@@ -198,7 +198,7 @@ For everything else, see [the llm tag](https://simonwillison.net/tags/llm/) on m
   * [Backoff](https://llm.datasette.io/en/stable/retry.html#backoff)
   * [Which errors are retried](https://llm.datasette.io/en/stable/retry.html#which-errors-are-retried)
   * [Interaction with logging](https://llm.datasette.io/en/stable/retry.html#interaction-with-logging)
-  * [Tool calls: current limitation and TBD](https://llm.datasette.io/en/stable/retry.html#tool-calls-current-limitation-and-tbd)
+  * [Tool calls and mid-chain retries](https://llm.datasette.io/en/stable/retry.html#tool-calls-and-mid-chain-retries)
 * [OpenAI models](https://llm.datasette.io/en/stable/openai-models.html)
   * [Configuration](https://llm.datasette.io/en/stable/openai-models.html#configuration)
   * [OpenAI language models](https://llm.datasette.io/en/stable/openai-models.html#openai-language-models)

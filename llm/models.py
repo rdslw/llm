@@ -2838,6 +2838,8 @@ class _BaseChainResponse:
         self.stream = stream
         self._key = key
         self._responses: list[Any] = []
+        self._current_response: _BaseResponse | None = None
+        self._retry_text_prefix = ""
         self.conversation = conversation
         self.chain_limit = chain_limit
         self.before_call = before_call
@@ -2852,6 +2854,49 @@ class _BaseChainResponse:
             else:
                 assert False, "Should have been a Response or AsyncResponse"
             sync_response.log_to_db(db)
+
+    def _retry_current(self):
+        """Return a continuation that retries only the incomplete provider turn."""
+        if self._current_response is None or self._current_response._done:
+            return None
+        continuation = type(self)(
+            self._current_response.prompt,
+            self.model,
+            self.stream,
+            self.conversation,
+            key=self._key,
+            chain_limit=self.chain_limit,
+            before_call=self.before_call,
+            after_call=self.after_call,
+        )
+        continuation._responses = list(self._responses)
+        continuation._retry_text_prefix = self._completed_text()
+        return continuation
+
+    def _completed_text(self) -> str:
+        """Join text from completed turns using normal chain boundaries."""
+        text = ""
+        for response in self._responses:
+            response_text = response.text_or_raise()
+            if (
+                text
+                and response_text
+                and not text[-1].isspace()
+                and not response_text[0].isspace()
+            ):
+                text += " "
+            text += response_text
+        return text
+
+    def _with_retry_text_prefix(self, text: str) -> str:
+        if (
+            self._retry_text_prefix
+            and text
+            and not self._retry_text_prefix[-1].isspace()
+            and not text[0].isspace()
+        ):
+            return f"{self._retry_text_prefix} {text}"
+        return self._retry_text_prefix + text
 
     def _pending_tool_calls(self) -> list[ToolCall]:
         """Unresolved tool calls at the end of this chain's history.
@@ -2896,7 +2941,7 @@ class ChainResponse(_BaseChainResponse):
 
     def responses(self) -> Iterator[Response]:
         prompt = self.prompt
-        count = 0
+        count = len(self._responses)
         initial_response = Response(
             prompt,
             self.model,
@@ -2930,8 +2975,10 @@ class ChainResponse(_BaseChainResponse):
         current_response: Response | None = initial_response
         while current_response:
             count += 1
+            self._current_response = current_response
             yield current_response
             self._responses.append(current_response)
+            self._current_response = None
             if self.chain_limit and count >= self.chain_limit:
                 raise ValueError(f"Chain limit of {self.chain_limit} exceeded.")
 
@@ -3026,7 +3073,7 @@ class ChainResponse(_BaseChainResponse):
                 yield event
 
     def text(self) -> str:
-        return "".join(self)
+        return self._with_retry_text_prefix("".join(self))
 
 
 class AsyncChainResponse(_BaseChainResponse):
@@ -3036,7 +3083,7 @@ class AsyncChainResponse(_BaseChainResponse):
 
     async def responses(self) -> AsyncIterator[AsyncResponse]:
         prompt = self.prompt
-        count = 0
+        count = len(self._responses)
         initial_response = AsyncResponse(
             prompt,
             self.model,
@@ -3068,8 +3115,10 @@ class AsyncChainResponse(_BaseChainResponse):
         current_response: AsyncResponse | None = initial_response
         while current_response:
             count += 1
+            self._current_response = current_response
             yield current_response
             self._responses.append(current_response)
+            self._current_response = None
 
             if self.chain_limit and count >= self.chain_limit:
                 raise ValueError(f"Chain limit of {self.chain_limit} exceeded.")
@@ -3159,7 +3208,7 @@ class AsyncChainResponse(_BaseChainResponse):
         all_chunks = []
         async for chunk in self:
             all_chunks.append(chunk)
-        return "".join(all_chunks)
+        return self._with_retry_text_prefix("".join(all_chunks))
 
 
 class Options(BaseModel):

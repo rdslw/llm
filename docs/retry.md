@@ -14,7 +14,7 @@ The value is the maximum total number of attempts:
 - `--cr 3` - up to three attempts: the initial request plus two retries.
 - `--cr 0` - retry without limit, until the request succeeds or a non-retryable condition stops it.
 
-The option applies to `llm prompt` only. It works with `--async` and with tool calls (see the limitation below).
+The option applies to `llm prompt` only. It works with `--async` and with tool calls, as described below.
 
 ## Backoff
 
@@ -42,32 +42,23 @@ A retry happens only when the error looks transient. The check lives in `_is_ret
 
 Everything else - authentication failures, invalid options, schema errors, unknown models - fails immediately, exactly as before.
 
-Two additional guards can cancel a retry even for a retryable error:
+Two additional rules apply even for retryable errors:
 
 1. **Output already started.** If any response text reached stdout before the failure (a stream that died mid-reply), the command fails as before. A retry would duplicate the partial text in pipes. Reasoning output does not count - it goes to stderr and never blocks a retry.
-2. **A tool chain already progressed.** See the next section.
+2. **Tool chains retry provider turns only.** A failed provider turn can be retried as described below. Failures after that turn completed, such as failures in local tool hooks, are not retried as provider requests.
 
 ## Interaction with logging
 
-Nothing is written to `logs.db` until a request fully succeeds, and each attempt builds a fresh response object. Failed attempts are therefore never logged, and a successful retry produces exactly one log entry.
+Nothing is written to `logs.db` until the prompt or tool chain succeeds. Failed provider attempts are never logged. A successful one-turn retry produces one turn in the log; a successful tool chain logs each of its completed provider turns exactly once.
 
-## Tool calls: current limitation and TBD
+## Tool calls and mid-chain retries
 
-When a prompt uses tools, the request becomes a chain: model turn, tool execution, next model turn, and so on. Retry currently covers only the **first** request of that chain:
+When a prompt uses local tools, the request becomes a chain: provider turn, local tool execution, next provider turn, and so on. A retryable failure can be retried on any provider turn as long as no response text from the chain reached stdout.
 
-- Failure during the first model turn (even after long reasoning output): retried normally.
-- Failure on a later turn, after at least one turn completed and its tools ran: **not retried**. The completed turn is already recorded on the conversation, and naively resending the original prompt would duplicate the user message on top of a history that ends in unresolved tool calls. The `len(conversation.responses)` guard in the retry loop detects this and fails fast instead.
+Later turns are retried without restarting the chain. The failed turn's `Prompt` contains the exact message history sent to the provider, including the results and attachments from local tools that already ran. Retry creates a new response from that same `Prompt`, preserves the chain's completed responses, and continues normally after success. It does **not** resend the original user prompt or execute those local tools again.
 
-**TBD - planned approach for mid-chain retry.** The codebase already contains a resume mechanism built for exactly this state: `ChainResponse.responses()` (`llm/models.py`, the `_pending_tool_calls` / `_resume_prompt` path) detects a history that ends in unresolved tool calls, re-executes those calls, and continues the chain. A future version of the retry loop can use it:
+This applies when a provider turn emitted only reasoning before failing: reasoning is displayed on stderr, so the retry may display reasoning from more than one attempt, but stdout remains clean. If any text event reached stdout during an earlier turn or the failed turn, retry is refused to avoid duplicate output.
 
-1. When the conversation grew during a failed attempt, re-call `conversation.chain(None, ...)` - no prompt text, attachments, or fragments (all already in history), same `tools` and `options`.
-2. The resume path re-runs the trailing tool calls and continues from the crash point; completed turns are preserved and logged once.
-3. Update the `responses_before` snapshot on every retry so later mid-chain failures can also resume.
+Only an incomplete provider response can use this path. A failure while executing a local tool or its `before_call`/`after_call` hook does not retry the provider turn that already completed.
 
-Open questions before implementing this:
-
-- Tool calls of the interrupted round would execute a **second time** (their first results were lost with the failed request). Acceptable for read-only tools; mutating tools would get duplicated side effects. Possibly needs an opt-in flag.
-- Whether `system`/`schema` may be passed again on the resume call without duplication.
-- Test coverage: a flaky model that emits tool calls in turn 1 and fails on turn 2.
-
-Until then, mid-chain failures behave exactly as they did before this feature existed.
+Provider-managed tools run inside the provider request rather than in LLM's local tool chain. If a failed provider request already caused such a tool to have side effects, retry cannot guarantee exactly-once execution for that provider-managed operation.

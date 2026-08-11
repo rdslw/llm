@@ -39,7 +39,7 @@ Some failures are transient - overloaded servers, rate limits, HTTP 5xx errors. 
 ```bash
 llm 'Ten names for cheesecakes' --cr 3
 ```
-The value is the maximum total number of attempts - the default `1` means no retry, `0` means retry without limit. Retry notices go to stderr, so piped stdout stays clean. Only errors that look temporary are retried; other errors, or a failure after the response has started streaming, fail immediately as usual. See {ref}`retry` for details.
+The value is the maximum total number of attempts - the default `1` means no retry, `0` means retry without limit. Retry notices go to stderr, so piped stdout stays clean. Only errors that look temporary are retried; other errors, or a failure after response text has reached stdout, fail immediately as usual. See {ref}`retry` for details.
 
 You can send a prompt directly to standard input like this:
 ```bash

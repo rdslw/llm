@@ -1078,42 +1078,50 @@ def prompt(
     if hide_reasoning:
         kwargs["hide_reasoning"] = True
 
-    responses_before = len(conversation.responses)
     total = chain_retry or "unlimited"
 
-    def prepare_retry(ex, attempt, printed):
-        can_retry = (
-            _is_retryable_error(ex)
-            and not printed["stdout"]
-            and len(conversation.responses) == responses_before
-            and (chain_retry == 0 or attempt < chain_retry)
-        )
-        if not can_retry:
+    def prepare_retry(ex, attempt, printed, response):
+        if (
+            not _is_retryable_error(ex)
+            or printed["stdout"]
+            or (chain_retry != 0 and attempt >= chain_retry)
+        ):
             return None
+
+        continuation = None
+        if isinstance(response, _BaseChainResponse):
+            continuation = response._retry_current()
+            if continuation is None:
+                return None
+
         delay = _retry_delay(attempt)
         click.echo(
             f"Retrying (attempt {attempt + 1}/{total}) in {delay:g}s: {ex}",
             err=True,
         )
-        return delay
+        return delay, continuation
 
     try:
         if async_:
 
             async def run_async():
                 attempt = 0
+                continuation = None
                 while True:
                     printed = {"stdout": False}
                     try:
-                        response = prompt_method(
-                            prompt,
-                            attachments=resolved_attachments,
-                            system=system,
-                            schema=schema,
-                            fragments=resolved_fragments,
-                            system_fragments=resolved_system_fragments,
-                            **kwargs,
-                        )
+                        response = continuation
+                        continuation = None
+                        if response is None:
+                            response = prompt_method(
+                                prompt,
+                                attachments=resolved_attachments,
+                                system=system,
+                                schema=schema,
+                                fragments=resolved_fragments,
+                                system_fragments=resolved_system_fragments,
+                                **kwargs,
+                            )
                         if should_stream:
                             await display_async_stream_events(
                                 response.astream_events(),
@@ -1135,26 +1143,31 @@ def prompt(
                         raise
                     except Exception as ex:
                         attempt += 1
-                        delay = prepare_retry(ex, attempt, printed)
-                        if delay is None:
+                        retry = prepare_retry(ex, attempt, printed, response)
+                        if retry is None:
                             raise
+                        delay, continuation = retry
                         await asyncio.sleep(delay)
 
             response = asyncio.run(run_async())
         else:
             attempt = 0
+            continuation = None
             while True:
                 printed = {"stdout": False}
                 try:
-                    response = prompt_method(
-                        prompt,
-                        fragments=resolved_fragments,
-                        attachments=resolved_attachments,
-                        system=system,
-                        schema=schema,
-                        system_fragments=resolved_system_fragments,
-                        **kwargs,
-                    )
+                    response = continuation
+                    continuation = None
+                    if response is None:
+                        response = prompt_method(
+                            prompt,
+                            fragments=resolved_fragments,
+                            attachments=resolved_attachments,
+                            system=system,
+                            schema=schema,
+                            system_fragments=resolved_system_fragments,
+                            **kwargs,
+                        )
                     if should_stream:
                         display_stream_events(
                             response.stream_events(),
@@ -1176,9 +1189,10 @@ def prompt(
                     raise
                 except Exception as ex:
                     attempt += 1
-                    delay = prepare_retry(ex, attempt, printed)
-                    if delay is None:
+                    retry = prepare_retry(ex, attempt, printed, response)
+                    if retry is None:
                         raise
+                    delay, continuation = retry
                     time.sleep(delay)
     # List of exceptions that should never be raised in pytest:
     except (ValueError, NotImplementedError) as ex:
