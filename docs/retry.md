@@ -45,7 +45,7 @@ Everything else - authentication failures, invalid options, schema errors, unkno
 Two additional rules apply even for retryable errors:
 
 1. **Output already started.** If any response text reached stdout before the failure (a stream that died mid-reply), the command fails as before. A retry would duplicate the partial text in pipes. Reasoning output does not count - it goes to stderr and never blocks a retry.
-2. **Tool chains retry provider turns only.** A failed provider turn can be retried as described below. Failures after that turn completed, such as failures in local tool hooks, are not retried as provider requests.
+2. **Streamed tool chains retry provider turns only.** A failed provider turn can be retried as described below. Failures after that turn completed, such as failures in local tool hooks, are not retried as provider requests.
 
 ## Interaction with logging
 
@@ -53,12 +53,14 @@ Nothing is written to `logs.db` until the prompt or tool chain succeeds. Failed 
 
 ## Tool calls and mid-chain retries
 
-When a prompt uses local tools, the request becomes a chain: provider turn, local tool execution, next provider turn, and so on. A retryable failure can be retried on any provider turn as long as no response text from the chain reached stdout.
+When a streamed prompt uses local tools, the request becomes a chain: provider turn, local tool execution, next provider turn, and so on. A retryable failure can be retried on any provider turn as long as no response text from the chain reached stdout.
 
-Later turns are retried without restarting the chain. The failed turn's `Prompt` contains the exact message history sent to the provider, including the results and attachments from local tools that already ran. Retry creates a new response from that same `Prompt`, preserves the chain's completed responses, and continues normally after success. It does **not** resend the original user prompt or execute those local tools again.
+Later turns are retried without restarting the chain. The failed turn's `Prompt` contains the exact message history sent to the provider, including the results and attachments from local tools that already ran. Retry reuses that `Prompt` and continues normally after success. It does **not** resend the original user prompt or execute those local tools again.
 
 This applies when a provider turn emitted only reasoning before failing: reasoning is displayed on stderr, so the retry may display reasoning from more than one attempt, but stdout remains clean. If any text event reached stdout during an earlier turn or the failed turn, retry is refused to avoid duplicate output.
 
 Only an incomplete provider response can use this path. A failure while executing a local tool or its `before_call`/`after_call` hook does not retry the provider turn that already completed.
+
+With `--no-stream`, retry still covers the first provider request but not a later failure after the tool chain has progressed.
 
 Provider-managed tools run inside the provider request rather than in LLM's local tool chain. If a failed provider request already caused such a tool to have side effects, retry cannot guarantee exactly-once execution for that provider-managed operation.

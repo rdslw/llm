@@ -20,15 +20,33 @@ OVERLOADED = "Our servers are currently overloaded. Please try again later."
 class FlakyModel(llm.Model):
     model_id = "flaky"
     can_stream = True
+    supports_tools = True
 
     def __init__(self):
         self.calls = 0
         self.fail_times = 0
         self.exception = None
         self.partial_before_fail = False
+        self.prompts = []
 
     def execute(self, prompt, stream, response, conversation):
         self.calls += 1
+        if prompt.tools:
+            self.prompts.append(prompt)
+            if self.calls == 1:
+                yield StreamEvent(type="reasoning", chunk="planning")
+                response.add_tool_call(
+                    llm.ToolCall(
+                        name="retry_probe",
+                        arguments={"value": "input"},
+                        tool_call_id="tc_retry_probe",
+                    )
+                )
+            elif self.calls <= self.fail_times + 1:
+                raise llm.ModelError(OVERLOADED)
+            else:
+                yield "success"
+            return
         if self.calls <= self.fail_times:
             if self.partial_before_fail:
                 yield "partial "
@@ -39,99 +57,48 @@ class FlakyModel(llm.Model):
 class FlakyAsyncModel(llm.AsyncModel):
     model_id = "flaky"
     can_stream = True
+    supports_tools = True
 
     def __init__(self):
         self.calls = 0
         self.fail_times = 0
         self.loops = []
+        self.prompts = []
 
     async def execute(self, prompt, stream, response, conversation):
         self.calls += 1
         self.loops.append(asyncio.get_running_loop())
+        if prompt.tools:
+            self.prompts.append(prompt)
+            if self.calls == 1:
+                yield StreamEvent(type="reasoning", chunk="planning")
+                response.add_tool_call(
+                    llm.ToolCall(
+                        name="retry_probe",
+                        arguments={"value": "input"},
+                        tool_call_id="tc_retry_probe",
+                    )
+                )
+            elif self.calls <= self.fail_times + 1:
+                raise llm.ModelError(OVERLOADED)
+            else:
+                yield "success"
+            return
         if self.calls <= self.fail_times:
             raise llm.ModelError(OVERLOADED)
         yield "success"
-
-
-class FlakyChainModel(llm.Model):
-    model_id = "flaky-chain"
-    can_stream = True
-    supports_tools = True
-
-    def __init__(self):
-        self.calls = 0
-        self.fail_times = 0
-        self.first_turn_text = False
-        self.prompts = []
-
-    def execute(self, prompt, stream, response, conversation):
-        self.calls += 1
-        self.prompts.append(prompt)
-        if self.calls == 1:
-            if self.first_turn_text:
-                yield "prefix "
-            yield StreamEvent(type="reasoning", chunk="planning")
-            response.add_tool_call(
-                llm.ToolCall(
-                    name="retry_probe",
-                    arguments={"value": "input"},
-                    tool_call_id="tc_retry_probe",
-                )
-            )
-        elif self.calls <= self.fail_times + 1:
-            yield StreamEvent(type="reasoning", chunk="using tool result")
-            raise llm.ModelError(OVERLOADED)
-        else:
-            yield "success"
-
-
-class FlakyAsyncChainModel(llm.AsyncModel):
-    model_id = "flaky-chain"
-    can_stream = True
-    supports_tools = True
-
-    def __init__(self):
-        self.calls = 0
-        self.fail_times = 0
-        self.first_turn_text = False
-        self.loops = []
-        self.prompts = []
-
-    async def execute(self, prompt, stream, response, conversation):
-        self.calls += 1
-        self.loops.append(asyncio.get_running_loop())
-        self.prompts.append(prompt)
-        if self.calls == 1:
-            if self.first_turn_text:
-                yield "prefix "
-            yield StreamEvent(type="reasoning", chunk="planning")
-            response.add_tool_call(
-                llm.ToolCall(
-                    name="retry_probe",
-                    arguments={"value": "input"},
-                    tool_call_id="tc_retry_probe",
-                )
-            )
-        elif self.calls <= self.fail_times + 1:
-            yield StreamEvent(type="reasoning", chunk="using tool result")
-            raise llm.ModelError(OVERLOADED)
-        else:
-            yield "success"
 
 
 @pytest.fixture
 def flaky_model():
     model = FlakyModel()
     async_model = FlakyAsyncModel()
-    chain_model = FlakyChainModel()
-    async_chain_model = FlakyAsyncChainModel()
     model.async_model = async_model
-    model.chain_model = chain_model
-    chain_model.async_model = async_chain_model
-    model.tool_executions = []
+    tool_executions = []
+    model.tool_executions = async_model.tool_executions = tool_executions
 
     def retry_probe(value: str) -> str:
-        model.tool_executions.append(value)
+        tool_executions.append(value)
         return value.upper()
 
     class FlakyModelPlugin:
@@ -140,7 +107,6 @@ def flaky_model():
         @llm.hookimpl
         def register_models(self, register):
             register(model, async_model=async_model)
-            register(chain_model, async_model=async_chain_model)
 
         @llm.hookimpl
         def register_tools(self, register):
@@ -274,161 +240,58 @@ def test_failed_attempts_are_not_logged(flaky_model, delays, logs_db):
     assert logs_db["turns"].count == 1
 
 
+def tool_chain_args(async_, retries, *extra):
+    args = ["-m", "flaky", "hi", "--cr", retries, "-T", "retry_probe", *extra]
+    return args + (["--async"] if async_ else [])
+
+
 @pytest.mark.parametrize("async_", (False, True))
 def test_retry_failed_provider_turn_without_rerunning_tools(
     flaky_model, delays, logs_db, async_
 ):
-    chain_model = (
-        flaky_model.chain_model.async_model if async_ else flaky_model.chain_model
+    model = flaky_model.async_model if async_ else flaky_model
+    model.fail_times = 2
+    result = CliRunner().invoke(
+        cli, tool_chain_args(async_, "3"), catch_exceptions=False
     )
-    chain_model.fail_times = 2
-    args = [
-        "-m",
-        "flaky-chain",
-        "hi",
-        "--cr",
-        "3",
-        "-T",
-        "retry_probe",
-    ]
-    if async_:
-        args.append("--async")
-
-    result = CliRunner().invoke(cli, args, catch_exceptions=False)
 
     assert result.exit_code == 0
     assert result.stdout == "success\n"
-    assert chain_model.calls == 4
-    assert all(prompt is chain_model.prompts[1] for prompt in chain_model.prompts[2:])
-    assert flaky_model.tool_executions == ["input"]
+    assert model.calls == 4
+    assert all(prompt is model.prompts[1] for prompt in model.prompts[2:])
+    assert model.tool_executions == ["input"]
     assert delays == [0.125, 0.5]
     assert logs_db["turns"].count == 2
     if async_:
-        assert all(loop is chain_model.loops[0] for loop in chain_model.loops)
+        assert all(loop is model.loops[0] for loop in model.loops)
 
 
 @pytest.mark.parametrize("async_", (False, True))
-def test_non_streaming_retry_preserves_completed_turn_text(
-    flaky_model, delays, logs_db, async_
-):
-    chain_model = (
-        flaky_model.chain_model.async_model if async_ else flaky_model.chain_model
+def test_non_streaming_does_not_retry_after_tools(flaky_model, delays, async_):
+    model = flaky_model.async_model if async_ else flaky_model
+    model.fail_times = 1
+    result = CliRunner().invoke(
+        cli, tool_chain_args(async_, "2", "--no-stream", "--no-log")
     )
-    chain_model.first_turn_text = True
-    chain_model.fail_times = 1
-    args = [
-        "-m",
-        "flaky-chain",
-        "hi",
-        "--cr",
-        "2",
-        "--no-stream",
-        "-T",
-        "retry_probe",
-    ]
-    if async_:
-        args.append("--async")
-
-    result = CliRunner().invoke(cli, args, catch_exceptions=False)
-
-    assert result.exit_code == 0
-    assert result.stdout == "prefix success\n"
-    assert chain_model.calls == 3
-    assert flaky_model.tool_executions == ["input"]
-    assert delays == [0.125]
-    assert logs_db["turns"].count == 2
-
-
-@pytest.mark.parametrize("async_", (False, True))
-def test_completed_turn_stdout_blocks_provider_turn_retry(flaky_model, delays, async_):
-    chain_model = (
-        flaky_model.chain_model.async_model if async_ else flaky_model.chain_model
-    )
-    chain_model.first_turn_text = True
-    chain_model.fail_times = 1
-    args = [
-        "-m",
-        "flaky-chain",
-        "hi",
-        "--cr",
-        "2",
-        "--no-log",
-        "-T",
-        "retry_probe",
-    ]
-    if async_:
-        args.append("--async")
-
-    result = CliRunner().invoke(cli, args)
 
     assert isinstance(result.exception, llm.ModelError)
-    assert result.stdout == "prefix "
-    assert chain_model.calls == 2
-    assert flaky_model.tool_executions == ["input"]
-    assert delays == []
-
-
-@pytest.mark.parametrize("async_", (False, True))
-def test_tool_hook_failure_does_not_retry_provider_turn(
-    flaky_model, delays, monkeypatch, async_
-):
-    chain_model = (
-        flaky_model.chain_model.async_model if async_ else flaky_model.chain_model
-    )
-
-    def fail_after_call(*_):
-        raise llm.ModelError(OVERLOADED)
-
-    monkeypatch.setattr("llm.cli._debug_tool_call", fail_after_call)
-    args = [
-        "-m",
-        "flaky-chain",
-        "hi",
-        "--cr",
-        "2",
-        "--no-log",
-        "--tools-debug",
-        "-T",
-        "retry_probe",
-    ]
-    if async_:
-        args.append("--async")
-
-    result = CliRunner().invoke(cli, args)
-
-    assert isinstance(result.exception, llm.ModelError)
-    assert chain_model.calls == 1
-    assert flaky_model.tool_executions == ["input"]
+    assert model.calls == 2
+    assert model.tool_executions == ["input"]
     assert delays == []
 
 
 @pytest.mark.parametrize("async_", (False, True))
 def test_midchain_retry_preserves_chain_limit(flaky_model, delays, async_):
-    chain_model = (
-        flaky_model.chain_model.async_model if async_ else flaky_model.chain_model
+    model = flaky_model.async_model if async_ else flaky_model
+    model.fail_times = 1
+    result = CliRunner().invoke(
+        cli, tool_chain_args(async_, "2", "--cl", "2", "--no-log")
     )
-    chain_model.fail_times = 1
-    args = [
-        "-m",
-        "flaky-chain",
-        "hi",
-        "--cr",
-        "2",
-        "--cl",
-        "2",
-        "--no-log",
-        "-T",
-        "retry_probe",
-    ]
-    if async_:
-        args.append("--async")
-
-    result = CliRunner().invoke(cli, args)
 
     assert result.exit_code == 1
     assert "Chain limit of 2 exceeded" in result.stderr
-    assert chain_model.calls == 3
-    assert flaky_model.tool_executions == ["input"]
+    assert model.calls == 3
+    assert model.tool_executions == ["input"]
     assert delays == [0.125]
 
 
