@@ -1616,6 +1616,31 @@ class _Shared:
         return kwargs
 
 
+def _chat_reasoning_text(obj) -> str | None:
+    """Reasoning text from a Chat Completions message or stream delta.
+
+    Not part of the OpenAI spec. DeepSeek, llama.cpp, SGLang and oMLX
+    use `reasoning_content`; Ollama, OpenRouter and newer vLLM use
+    `reasoning`. The OpenAI SDK keeps both as extra attributes. The
+    first non-empty string wins, so a server that sends both fields
+    does not duplicate the text.
+    """
+    if obj is None:
+        return None
+    for name in ("reasoning_content", "reasoning"):
+        value = getattr(obj, name, None)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _reasoning_redacted(usage: dict | None, saw_reasoning: bool) -> bool:
+    """True when reasoning tokens were counted but no reasoning text came back."""
+    if saw_reasoning or not usage:
+        return False
+    return bool((usage.get("completion_tokens_details") or {}).get("reasoning_tokens"))
+
+
 class Chat(_Shared, KeyModel):
     needs_key = "openai"
     key_env_var = "OPENAI_API_KEY"
@@ -1641,6 +1666,7 @@ class Chat(_Shared, KeyModel):
         kwargs = self.build_kwargs(prompt, stream)
         client = self.get_client(key)
         usage = None
+        saw_reasoning = False
         if stream:
             completion = client.chat.completions.create(
                 model=self.model_name or self.model_id,
@@ -1654,8 +1680,14 @@ class Chat(_Shared, KeyModel):
                 chunks.append(chunk)
                 if chunk.usage:
                     usage = chunk.usage.model_dump()
-                if chunk.choices and chunk.choices[0].delta:
-                    for tool_call in chunk.choices[0].delta.tool_calls or []:
+                delta = chunk.choices[0].delta if chunk.choices else None
+                # Reasoning first: it precedes tool calls and text.
+                reasoning = _chat_reasoning_text(delta)
+                if reasoning:
+                    saw_reasoning = True
+                    yield StreamEvent(type="reasoning", chunk=reasoning)
+                if delta:
+                    for tool_call in delta.tool_calls or []:
                         if tool_call.function.arguments is None:
                             tool_call.function.arguments = ""
                         idx = tool_call.index
@@ -1676,10 +1708,7 @@ class Chat(_Shared, KeyModel):
                                 chunk=tool_call.function.arguments,
                                 tool_call_id=tool_calls[idx].id,
                             )
-                try:
-                    content = chunk.choices[0].delta.content
-                except IndexError:
-                    content = None
+                content = delta.content if delta is not None else None
                 if content:
                     # Empty strings are noise (OpenAI's first chunk
                     # with role=assistant has content="").
@@ -1704,7 +1733,13 @@ class Chat(_Shared, KeyModel):
             if completion.usage:
                 usage = completion.usage.model_dump()
             response.response_json = remove_dict_none_values(completion.model_dump())
-            for tool_call in completion.choices[0].message.tool_calls or []:
+            message = completion.choices[0].message
+            # Reasoning first: it precedes tool calls and text.
+            reasoning = _chat_reasoning_text(message)
+            if reasoning:
+                saw_reasoning = True
+                yield StreamEvent(type="reasoning", chunk=reasoning)
+            for tool_call in message.tool_calls or []:
                 response.add_tool_call(
                     llm.ToolCall(
                         tool_call_id=tool_call.id,
@@ -1722,15 +1757,10 @@ class Chat(_Shared, KeyModel):
                     chunk=tool_call.function.arguments or "",
                     tool_call_id=tool_call.id,
                 )
-            if completion.choices[0].message.content is not None:
-                yield StreamEvent(
-                    type="text",
-                    chunk=completion.choices[0].message.content,
-                )
+            if message.content is not None:
+                yield StreamEvent(type="text", chunk=message.content)
         self.set_usage(response, usage)
-        if usage and (usage.get("completion_tokens_details") or {}).get(
-            "reasoning_tokens"
-        ):
+        if _reasoning_redacted(usage, saw_reasoning):
             yield StreamEvent(type="reasoning", chunk="", redacted=True)
         response._prompt_json = redact_data({"messages": messages})
 
@@ -1760,6 +1790,7 @@ class AsyncChat(_Shared, AsyncKeyModel):
         kwargs = self.build_kwargs(prompt, stream)
         client = self.get_client(key, async_=True)
         usage = None
+        saw_reasoning = False
         if stream:
             completion = await client.chat.completions.create(
                 model=self.model_name or self.model_id,
@@ -1773,8 +1804,14 @@ class AsyncChat(_Shared, AsyncKeyModel):
                 if chunk.usage:
                     usage = chunk.usage.model_dump()
                 chunks.append(chunk)
-                if chunk.choices and chunk.choices[0].delta:
-                    for tool_call in chunk.choices[0].delta.tool_calls or []:
+                delta = chunk.choices[0].delta if chunk.choices else None
+                # Reasoning first: it precedes tool calls and text.
+                reasoning = _chat_reasoning_text(delta)
+                if reasoning:
+                    saw_reasoning = True
+                    yield StreamEvent(type="reasoning", chunk=reasoning)
+                if delta:
+                    for tool_call in delta.tool_calls or []:
                         if tool_call.function.arguments is None:
                             tool_call.function.arguments = ""
                         idx = tool_call.index
@@ -1795,10 +1832,7 @@ class AsyncChat(_Shared, AsyncKeyModel):
                                 chunk=tool_call.function.arguments,
                                 tool_call_id=tool_calls[idx].id,
                             )
-                try:
-                    content = chunk.choices[0].delta.content
-                except IndexError:
-                    content = None
+                content = delta.content if delta is not None else None
                 if content:
                     yield StreamEvent(type="text", chunk=content)
             if tool_calls:
@@ -1821,7 +1855,13 @@ class AsyncChat(_Shared, AsyncKeyModel):
             response.response_json = remove_dict_none_values(completion.model_dump())
             if completion.usage:
                 usage = completion.usage.model_dump()
-            for tool_call in completion.choices[0].message.tool_calls or []:
+            message = completion.choices[0].message
+            # Reasoning first: it precedes tool calls and text.
+            reasoning = _chat_reasoning_text(message)
+            if reasoning:
+                saw_reasoning = True
+                yield StreamEvent(type="reasoning", chunk=reasoning)
+            for tool_call in message.tool_calls or []:
                 response.add_tool_call(
                     llm.ToolCall(
                         tool_call_id=tool_call.id,
@@ -1839,15 +1879,10 @@ class AsyncChat(_Shared, AsyncKeyModel):
                     chunk=tool_call.function.arguments or "",
                     tool_call_id=tool_call.id,
                 )
-            if completion.choices[0].message.content is not None:
-                yield StreamEvent(
-                    type="text",
-                    chunk=completion.choices[0].message.content,
-                )
+            if message.content is not None:
+                yield StreamEvent(type="text", chunk=message.content)
         self.set_usage(response, usage)
-        if usage and (usage.get("completion_tokens_details") or {}).get(
-            "reasoning_tokens"
-        ):
+        if _reasoning_redacted(usage, saw_reasoning):
             yield StreamEvent(type="reasoning", chunk="", redacted=True)
         response._prompt_json = redact_data({"messages": messages})
 
@@ -3237,6 +3272,7 @@ def not_nulls(data) -> dict:
 
 def combine_chunks(chunks: list) -> dict:
     content = ""
+    reasoning_content = ""
     role = None
     finish_reason = None
     # If any of them have log probability, we're going to persist
@@ -3260,6 +3296,9 @@ def combine_chunks(chunks: list) -> dict:
                 content += choice.text
                 continue
             role = choice.delta.role
+            reasoning = _chat_reasoning_text(choice.delta)
+            if reasoning:
+                reasoning_content += reasoning
             if choice.delta.content is not None:
                 content += choice.delta.content
             if choice.finish_reason is not None:
@@ -3272,6 +3311,10 @@ def combine_chunks(chunks: list) -> dict:
         "finish_reason": finish_reason,
         "usage": usage,
     }
+    # Kept under one name, whichever field (reasoning_content or
+    # reasoning) the server streamed.
+    if reasoning_content:
+        combined["reasoning_content"] = reasoning_content
     if logprobs:
         combined["logprobs"] = logprobs
     if chunks:

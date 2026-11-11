@@ -611,3 +611,357 @@ class TestNonStreamingExecuteYieldsStreamEvents:
         assert response.messages() == [
             llm.Message(role="assistant", parts=[llm.parts.TextPart(text="Hello")])
         ]
+
+
+def _reasoning_stream(field="reasoning_content", usage=None):
+    """oMLX / llama.cpp / DeepSeek style: reasoning text in an extra delta field."""
+    yield _sse({"role": "assistant", "content": ""})
+    yield _sse({"content": None, field: "step one"})
+    yield _sse({"content": None, field: ", step two"})
+    yield _sse({"content": "Hel"})
+    yield _sse({"content": "lo"})
+    yield _sse({}, finish_reason="stop")
+    if usage is not None:
+        yield _sse({}, usage=usage)
+    yield b"data: [DONE]\n\n"
+
+
+def _reasoning_completion(**message_extra):
+    return {
+        "id": "c1",
+        "object": "chat.completion",
+        "created": 1700000000,
+        "model": "gpt-4o-mini",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "Hello", **message_extra},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 5,
+            "completion_tokens": 7,
+            "total_tokens": 12,
+            "completion_tokens_details": {"reasoning_tokens": 5},
+        },
+    }
+
+
+_REASONING_MESSAGES = [
+    llm.Message(
+        role="assistant",
+        parts=[
+            llm.parts.ReasoningPart(text="step one, step two"),
+            llm.parts.TextPart(text="Hello"),
+        ],
+    )
+]
+
+
+class TestChatCompletionsReasoningText:
+    @pytest.mark.parametrize("field", ["reasoning_content", "reasoning"])
+    def test_streaming_yields_reasoning_then_text(self, httpx2_mock, field):
+        httpx2_mock.add_response(
+            method="POST",
+            url="https://api.openai.com/v1/chat/completions",
+            stream=IteratorStream(_reasoning_stream(field)),
+            headers={"Content-Type": "text/event-stream"},
+        )
+        model = llm.get_model("gpt-4o-mini")
+        response = model.prompt("hi", key=API_KEY)
+        events = list(response.stream_events())
+        assert events == [
+            llm.parts.StreamEvent(type="reasoning", chunk="step one", part_index=0),
+            llm.parts.StreamEvent(type="reasoning", chunk=", step two", part_index=0),
+            llm.parts.StreamEvent(type="text", chunk="Hel", part_index=1),
+            llm.parts.StreamEvent(type="text", chunk="lo", part_index=1),
+        ]
+        assert response.messages() == _REASONING_MESSAGES
+        assert response.text() == "Hello"
+
+    def test_no_redacted_marker_when_reasoning_text_present(self, httpx2_mock):
+        usage = {
+            "prompt_tokens": 5,
+            "completion_tokens": 7,
+            "total_tokens": 12,
+            "completion_tokens_details": {"reasoning_tokens": 5},
+        }
+        httpx2_mock.add_response(
+            method="POST",
+            url="https://api.openai.com/v1/chat/completions",
+            stream=IteratorStream(_reasoning_stream(usage=usage)),
+            headers={"Content-Type": "text/event-stream"},
+        )
+        model = llm.get_model("gpt-4o-mini")
+        response = model.prompt("hi", key=API_KEY)
+        response.text()
+        assert response.messages() == _REASONING_MESSAGES
+
+    def test_both_fields_do_not_duplicate_text(self, httpx2_mock):
+        def stream():
+            yield _sse({"role": "assistant", "content": ""})
+            yield _sse({"reasoning_content": "think", "reasoning": "think"})
+            yield _sse({"content": "Hello"})
+            yield _sse({}, finish_reason="stop")
+            yield b"data: [DONE]\n\n"
+
+        httpx2_mock.add_response(
+            method="POST",
+            url="https://api.openai.com/v1/chat/completions",
+            stream=IteratorStream(stream()),
+            headers={"Content-Type": "text/event-stream"},
+        )
+        model = llm.get_model("gpt-4o-mini")
+        response = model.prompt("hi", key=API_KEY)
+        response.text()
+        assert response.messages()[0].parts == [
+            llm.parts.ReasoningPart(text="think"),
+            llm.parts.TextPart(text="Hello"),
+        ]
+
+    def test_non_string_reasoning_field_is_ignored(self, httpx2_mock):
+        def stream():
+            yield _sse({"role": "assistant", "content": ""})
+            yield _sse({"reasoning": {"effort": "low"}, "content": "Hello"})
+            yield _sse({}, finish_reason="stop")
+            yield b"data: [DONE]\n\n"
+
+        httpx2_mock.add_response(
+            method="POST",
+            url="https://api.openai.com/v1/chat/completions",
+            stream=IteratorStream(stream()),
+            headers={"Content-Type": "text/event-stream"},
+        )
+        model = llm.get_model("gpt-4o-mini")
+        response = model.prompt("hi", key=API_KEY)
+        response.text()
+        assert response.messages()[0].parts == [llm.parts.TextPart(text="Hello")]
+
+    @pytest.mark.parametrize("field", ["reasoning_content", "reasoning"])
+    def test_non_streaming_yields_reasoning_then_text(self, httpx2_mock, field):
+        httpx2_mock.add_response(
+            method="POST",
+            url="https://api.openai.com/v1/chat/completions",
+            json=_reasoning_completion(**{field: "step one, step two"}),
+            headers={"Content-Type": "application/json"},
+        )
+        model = llm.get_model("gpt-4o-mini")
+        response = model.prompt("hi", key=API_KEY, stream=False)
+        events = list(response.stream_events())
+        assert events == [
+            llm.parts.StreamEvent(
+                type="reasoning", chunk="step one, step two", part_index=0
+            ),
+            llm.parts.StreamEvent(type="text", chunk="Hello", part_index=1),
+        ]
+        assert response.messages() == _REASONING_MESSAGES
+
+    @pytest.mark.asyncio
+    async def test_async_streaming_yields_reasoning_then_text(self, httpx2_mock):
+        httpx2_mock.add_response(
+            method="POST",
+            url="https://api.openai.com/v1/chat/completions",
+            stream=IteratorStream(_reasoning_stream()),
+            headers={"Content-Type": "text/event-stream"},
+        )
+        model = llm.get_async_model("gpt-4o-mini")
+        response = model.prompt("hi", key=API_KEY)
+        events = [event async for event in response.astream_events()]
+        assert [(e.type, e.chunk) for e in events] == [
+            ("reasoning", "step one"),
+            ("reasoning", ", step two"),
+            ("text", "Hel"),
+            ("text", "lo"),
+        ]
+        assert await response.messages() == _REASONING_MESSAGES
+
+    @pytest.mark.asyncio
+    async def test_async_non_streaming_yields_reasoning_then_text(self, httpx2_mock):
+        httpx2_mock.add_response(
+            method="POST",
+            url="https://api.openai.com/v1/chat/completions",
+            json=_reasoning_completion(reasoning_content="step one, step two"),
+            headers={"Content-Type": "application/json"},
+        )
+        model = llm.get_async_model("gpt-4o-mini")
+        response = model.prompt("hi", key=API_KEY, stream=False)
+        events = [event async for event in response.astream_events()]
+        assert [(e.type, e.chunk) for e in events] == [
+            ("reasoning", "step one, step two"),
+            ("text", "Hello"),
+        ]
+        assert await response.messages() == _REASONING_MESSAGES
+
+
+def _get_weather(city: str) -> str:
+    "Look up the weather."
+    return "sunny"
+
+
+def _reasoning_tool_call_stream():
+    """Reasoning, then a chunk that carries reasoning and a tool call start."""
+    yield _sse({"role": "assistant", "content": None})
+    yield _sse({"reasoning_content": "step one"})
+    yield _sse(
+        {"reasoning_content": ", step two"},
+        tool_calls=[
+            {
+                "index": 0,
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "get_weather", "arguments": ""},
+            }
+        ],
+    )
+    yield _sse({}, tool_calls=[{"index": 0, "function": {"arguments": '{"city":'}}])
+    yield _sse({}, tool_calls=[{"index": 0, "function": {"arguments": '"Paris"}'}}])
+    yield _sse({}, finish_reason="tool_calls")
+    yield b"data: [DONE]\n\n"
+
+
+def _reasoning_tool_call_completion():
+    completion = _reasoning_completion(reasoning_content="step one, step two")
+    message = completion["choices"][0]["message"]
+    message["content"] = None
+    message["tool_calls"] = [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "get_weather", "arguments": '{"city":"Paris"}'},
+        }
+    ]
+    completion["choices"][0]["finish_reason"] = "tool_calls"
+    return completion
+
+
+_REASONING_TOOL_CALL_TYPES = [
+    "reasoning",
+    "reasoning",
+    "tool_call_name",
+    "tool_call_args",
+    "tool_call_args",
+]
+
+
+def _assert_reasoning_then_tool_call(messages):
+    (message,) = messages
+    reasoning, tool_call = message.parts
+    assert reasoning == llm.parts.ReasoningPart(text="step one, step two")
+    assert isinstance(tool_call, llm.parts.ToolCallPart)
+    assert tool_call.name == "get_weather"
+    assert tool_call.arguments == {"city": "Paris"}
+
+
+class TestChatCompletionsReasoningBeforeToolCalls:
+    """Reasoning precedes tool calls in all four Chat paths (simonw/llm#1691)."""
+
+    def test_streaming(self, httpx2_mock):
+        httpx2_mock.add_response(
+            method="POST",
+            url="https://api.openai.com/v1/chat/completions",
+            stream=IteratorStream(_reasoning_tool_call_stream()),
+            headers={"Content-Type": "text/event-stream"},
+        )
+        model = llm.get_model("gpt-4o-mini")
+        response = model.prompt("weather?", tools=[_get_weather], key=API_KEY)
+        events = list(response.stream_events())
+        assert [e.type for e in events] == _REASONING_TOOL_CALL_TYPES
+        _assert_reasoning_then_tool_call(response.messages())
+        assert response.tool_calls()[0].arguments == {"city": "Paris"}
+
+    def test_non_streaming(self, httpx2_mock):
+        httpx2_mock.add_response(
+            method="POST",
+            url="https://api.openai.com/v1/chat/completions",
+            json=_reasoning_tool_call_completion(),
+            headers={"Content-Type": "application/json"},
+        )
+        model = llm.get_model("gpt-4o-mini")
+        response = model.prompt(
+            "weather?", tools=[_get_weather], key=API_KEY, stream=False
+        )
+        events = list(response.stream_events())
+        assert [e.type for e in events] == [
+            "reasoning",
+            "tool_call_name",
+            "tool_call_args",
+        ]
+        _assert_reasoning_then_tool_call(response.messages())
+
+    @pytest.mark.asyncio
+    async def test_async_streaming(self, httpx2_mock):
+        httpx2_mock.add_response(
+            method="POST",
+            url="https://api.openai.com/v1/chat/completions",
+            stream=IteratorStream(_reasoning_tool_call_stream()),
+            headers={"Content-Type": "text/event-stream"},
+        )
+        model = llm.get_async_model("gpt-4o-mini")
+        response = model.prompt("weather?", tools=[_get_weather], key=API_KEY)
+        events = [event async for event in response.astream_events()]
+        assert [e.type for e in events] == _REASONING_TOOL_CALL_TYPES
+        _assert_reasoning_then_tool_call(await response.messages())
+
+    @pytest.mark.asyncio
+    async def test_async_non_streaming(self, httpx2_mock):
+        httpx2_mock.add_response(
+            method="POST",
+            url="https://api.openai.com/v1/chat/completions",
+            json=_reasoning_tool_call_completion(),
+            headers={"Content-Type": "application/json"},
+        )
+        model = llm.get_async_model("gpt-4o-mini")
+        response = model.prompt(
+            "weather?", tools=[_get_weather], key=API_KEY, stream=False
+        )
+        events = [event async for event in response.astream_events()]
+        assert [e.type for e in events] == [
+            "reasoning",
+            "tool_call_name",
+            "tool_call_args",
+        ]
+        _assert_reasoning_then_tool_call(await response.messages())
+
+
+class TestCombineChunksKeepsReasoning:
+    @pytest.mark.parametrize("field", ["reasoning_content", "reasoning"])
+    def test_streamed_response_json_has_reasoning_content(self, httpx2_mock, field):
+        httpx2_mock.add_response(
+            method="POST",
+            url="https://api.openai.com/v1/chat/completions",
+            stream=IteratorStream(_reasoning_stream(field)),
+            headers={"Content-Type": "text/event-stream"},
+        )
+        model = llm.get_model("gpt-4o-mini")
+        response = model.prompt("hi", key=API_KEY)
+        response.text()
+        assert response.response_json["content"] == "Hello"
+        assert response.response_json["reasoning_content"] == "step one, step two"
+
+    @pytest.mark.asyncio
+    async def test_async_streamed_response_json_has_reasoning_content(
+        self, httpx2_mock
+    ):
+        httpx2_mock.add_response(
+            method="POST",
+            url="https://api.openai.com/v1/chat/completions",
+            stream=IteratorStream(_reasoning_stream()),
+            headers={"Content-Type": "text/event-stream"},
+        )
+        model = llm.get_async_model("gpt-4o-mini")
+        response = model.prompt("hi", key=API_KEY)
+        await response.text()
+        assert response.response_json["reasoning_content"] == "step one, step two"
+
+    def test_no_reasoning_key_without_reasoning(self, httpx2_mock):
+        httpx2_mock.add_response(
+            method="POST",
+            url="https://api.openai.com/v1/chat/completions",
+            stream=IteratorStream(_text_stream()),
+            headers={"Content-Type": "text/event-stream"},
+        )
+        model = llm.get_model("gpt-4o-mini")
+        response = model.prompt("hi", key=API_KEY)
+        response.text()
+        assert "reasoning_content" not in response.response_json
